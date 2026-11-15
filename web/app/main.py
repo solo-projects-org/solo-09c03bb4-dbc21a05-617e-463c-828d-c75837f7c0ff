@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import db
+from . import propagation
 from .collector import CollectionError, collect_day
 from .station_client import StationClient, StationError
 
@@ -43,6 +44,14 @@ app = FastAPI(title="Section water quality collector", version="1.0", lifespan=l
 class CollectBody(BaseModel):
     section: str = Field(..., examples=["SECTION-A"])
     date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", examples=["2026-11-14"])
+
+
+class AnalyzeBody(BaseModel):
+    upstream_section: str = Field(..., examples=["SECTION-A"])
+    downstream_section: str = Field(..., examples=["SECTION-B"])
+    date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", examples=["2026-11-14"])
+    threshold: float = Field(..., gt=0, examples=[0.1])
+    max_lag_hours: int = Field(..., ge=1, le=6, examples=[3])
 
 
 def _run_collection(run_id: int, section: str, date_str: str) -> None:
@@ -124,6 +133,37 @@ def api_published(section: str, date: str) -> dict:
     return published
 
 
+@app.post("/api/analyze")
+def api_analyze(body: AnalyzeBody) -> dict:
+    """Run one propagation check against a single committed snapshot."""
+    if body.upstream_section == body.downstream_section:
+        raise HTTPException(status_code=400, detail="上下游断面不能相同")
+    try:
+        return propagation.analyze(
+            DB_PATH,
+            body.upstream_section,
+            body.downstream_section,
+            body.date,
+            body.threshold,
+            body.max_lag_hours,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.get("/api/analyses")
+def api_analyses(limit: int = 30) -> list[dict]:
+    return propagation.list_recent(DB_PATH, min(max(limit, 1), 200))
+
+
+@app.get("/api/analyses/{analysis_id}")
+def api_analysis(analysis_id: int) -> dict:
+    stored = propagation.get_analysis(DB_PATH, analysis_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="analysis not found")
+    return stored
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return PAGE_HTML
@@ -149,6 +189,13 @@ PAGE_HTML = """<!doctype html>
   .tag { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .8rem; }
   .running { background: #fff3cd; } .success { background: #d1f0dd; }
   .failed { background: #f8d4d4; } .interrupted { background: #e1d5f7; }
+  .conclusive { background: #d1f0dd; }
+  .indeterminate { background: #ffe3b3; }
+  .stale { background: #f8d4d4; }
+  .verdict { padding: .8rem 1rem; border-radius: 8px; margin: .8rem 0; font-weight: 600; }
+  .verdict.indeterminate { background: #fff4e0; border: 1px solid #e0a94a; }
+  .verdict.stale { background: #fdeaea; border: 1px solid #d64545; }
+  .verdict.conclusive { background: #e6f7ec; border: 1px solid #2f9e5f; }
   #msg { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: .85rem; }
 </style>
 </head>
@@ -178,6 +225,30 @@ PAGE_HTML = """<!doctype html>
 </div>
 
 <div class="panel">
+  <h3>污染传播溯源 — 上游突升是否传到下游</h3>
+  <p class="muted">上游取当日 01:00～23:00 的逐时增量；下游取当日与次日（覆盖跨午夜传播）。
+    每个下游突升至多匹配一次：先使配对数最多，再使总滞后最短。
+    三份日档必须属于同一已提交状态，任一缺失即“无法判断”，不会报成无传播。</p>
+  <label>上游断面 <select id="upSection"></select></label>
+  <label>下游断面 <select id="downSection"></select></label>
+  <label>UTC 日期 <input id="anDate" type="date" required></label>
+  <label>突升阈值 (mg/L) <input id="threshold" type="number" min="0.001" step="0.001" value="0.05"></label>
+  <label>最大滞后
+    <select id="maxLag">
+      <option>1</option><option>2</option><option selected>3</option>
+      <option>4</option><option>5</option><option>6</option>
+    </select> 小时
+  </label>
+  <button id="analyzeBtn">分析传播</button>
+  <div id="analysis"></div>
+</div>
+
+<div class="panel">
+  <h3>最近分析记录</h3>
+  <div id="history"></div>
+</div>
+
+<div class="panel">
   <h3>消息</h3>
   <div id="msg" class="muted"></div>
 </div>
@@ -191,7 +262,12 @@ async function loadSections() {
   const r = await fetch('/api/sections');
   if (!r.ok) { msg('无法获取断面列表：' + r.status); return; }
   const data = await r.json();
-  $('section').innerHTML = data.sections.map(s => `<option>${esc(s)}</option>`).join('');
+  const options = data.sections.map(s => `<option>${esc(s)}</option>`).join('');
+  $('section').innerHTML = options;
+  $('upSection').innerHTML = options;
+  $('downSection').innerHTML = options;
+  const idx = data.sections.indexOf('SECTION-B');
+  $('downSection').selectedIndex = idx >= 0 ? idx : Math.min(1, data.sections.length - 1);
 }
 
 function params() {
@@ -253,12 +329,105 @@ async function renderPublished() {
     '</table>';
 }
 
+function fmtArchive(a) {
+  return `<tr><td>${esc(a.role)}</td><td>${esc(a.section)}</td><td>${esc(a.date)}</td>
+    <td>${a.revision}</td><td>${a.sequence}</td><td>${a.rows ?? a.row_count}</td>
+    <td>${esc(a.published_at)}</td><td>${esc(a.published_by)}</td></tr>`;
+}
+
+const STATUS_LABEL = { conclusive: '可判断', indeterminate: '无法判断', stale: '结果已过期' };
+
+function renderAnalysis(d) {
+  const label = STATUS_LABEL[d.status] || d.status;
+  let html = `<div class="verdict ${d.status}">[${esc(label)}] ${esc(d.message)}</div>`;
+  if (d.missing && d.missing.length) {
+    html += '<h4>缺失日档</h4><ul>' + d.missing.map(m => `<li>${esc(m)}</li>`).join('') + '</ul>';
+  }
+  if (d.stale_reasons && d.stale_reasons.length) {
+    html += '<h4>换版详情</h4><ul>' + d.stale_reasons.map(m => `<li>${esc(m)}</li>`).join('') + '</ul>';
+  }
+  if (d.archives && d.archives.length) {
+    html += `<h4>所用日档（快照 ${esc(d.snapshot_token)}，同一已提交状态）</h4>
+      <table><tr><th>角色</th><th>断面</th><th>UTC 日期</th><th>修订号</th>
+      <th>发布序号</th><th>行数</th><th>发布时间</th><th>发布者</th></tr>` +
+      d.archives.map(fmtArchive).join('') + '</table>';
+  }
+  if (d.result) {
+    html += `<h4>传播配对（${d.result.match_count} 组，总滞后 ${d.result.total_lag_hours} 小时；
+      上游突升 ${d.result.upstream_surges.length} 个，下游突升 ${d.result.downstream_surges.length} 个）</h4>`;
+    if (d.result.matches.length) {
+      html += '<table><tr><th>上游突升时刻 (UTC)</th><th>下游突升时刻 (UTC)</th>' +
+        '<th>滞后（小时）</th><th>上游增量</th><th>下游增量</th>' +
+        '<th>上游日档修订</th><th>下游日档修订</th></tr>' +
+        d.result.matches.map(m => `<tr><td>${esc(m.upstream_time)}</td>
+          <td>${esc(m.downstream_time)}</td><td>${m.lag_hours}</td>
+          <td>${m.upstream_delta}</td><td>${m.downstream_delta}</td>
+          <td>${esc(m.upstream_date)} · r${m.upstream_revision} · seq ${m.upstream_sequence}</td>
+          <td>${esc(m.downstream_date)} · r${m.downstream_revision} · seq ${m.downstream_sequence}</td></tr>`).join('') + '</table>';
+    } else {
+      html += '<p class="muted">给定阈值与最大滞后内没有可配对项。</p>';
+    }
+    if (d.result.downstream_surges.length) {
+      html += '<details><summary>下游突升清单（含未配对项）</summary>' +
+        '<table><tr><th>时刻 (UTC)</th><th>增量</th></tr>' +
+        d.result.downstream_surges.map(s => `<tr><td>${esc(s.time)}</td><td>${s.delta}</td></tr>`).join('') +
+        '</table></details>';
+    }
+  }
+  if (d.id) {
+    html += `<p class="muted">分析编号 #${d.id} · 计算于 ${esc(d.created_at)} ·
+      参数：阈值 ${d.threshold} mg/L，最大滞后 ${d.max_lag_hours} 小时</p>`;
+  }
+  $('analysis').innerHTML = html;
+}
+
+async function runAnalysis() {
+  const date = $('anDate').value;
+  if (!date) { msg('请选择分析用的 UTC 日期'); return; }
+  const body = {
+    upstream_section: $('upSection').value,
+    downstream_section: $('downSection').value,
+    date,
+    threshold: parseFloat($('threshold').value),
+    max_lag_hours: parseInt($('maxLag').value, 10)
+  };
+  if (!(body.threshold > 0)) { msg('突升阈值必须是正数'); return; }
+  if (body.upstream_section === body.downstream_section) { msg('上下游断面不能相同'); return; }
+  $('analyzeBtn').disabled = true;
+  try {
+    const r = await fetch('/api/analyze', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (!r.ok) { msg('分析失败 (' + r.status + '): ' + JSON.stringify(data.detail)); return; }
+    renderAnalysis(data);
+    await renderHistory();
+  } finally {
+    $('analyzeBtn').disabled = false;
+  }
+}
+
+async function renderHistory() {
+  const r = await fetch('/api/analyses?limit=15');
+  const items = await r.json();
+  if (!items.length) { $('history').innerHTML = '<p class="muted">暂无分析记录</p>'; return; }
+  $('history').innerHTML = '<table><tr><th>#</th><th>上游 → 下游</th><th>UTC 日期</th>' +
+    '<th>阈值</th><th>最大滞后</th><th>状态</th><th>时间</th></tr>' +
+    items.map(a => `<tr><td>${a.id}</td>
+      <td>${esc(a.upstream_section)} → ${esc(a.downstream_section)}</td>
+      <td>${esc(a.date)}</td><td>${a.threshold}</td><td>${a.max_lag_hours}h</td>
+      <td><span class="tag ${a.status}">${esc(STATUS_LABEL[a.status] || a.status)}</span></td>
+      <td>${esc(a.created_at)}</td></tr>`).join('') + '</table>';
+}
+
 $('collectBtn').onclick = startCollect;
 $('viewBtn').onclick = async () => { await renderRuns(); await renderPublished(); };
+$('analyzeBtn').onclick = runAnalysis;
 $('section').onchange = async () => { await renderRuns(); await renderPublished(); };
 $('date').onchange = async () => { await renderRuns(); await renderPublished(); };
 $('date').value = new Date().toISOString().slice(0, 10);
-loadSections().then(renderRuns).then(renderPublished);
+$('anDate').value = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+loadSections().then(renderRuns).then(renderPublished).then(renderHistory);
 </script>
 </body>
 </html>

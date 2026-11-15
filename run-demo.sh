@@ -16,3 +16,4 @@ for port in 8001 8011 8012; do
 done
 
 python3 -I demo/demo.py
+python3 -I demo/propagation-demo.py
