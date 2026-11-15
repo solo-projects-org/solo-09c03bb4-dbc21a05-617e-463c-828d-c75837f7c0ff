@@ -1,0 +1,56 @@
+# County station mock + two replicated web collector processes sharing SQLite.
+services:
+  station:
+    build: ./station
+    environment:
+      # 24 hourly rows / 8 per page => 3 pages, leaving time to correct mid-run.
+      PAGE_SIZE: "8"
+      PAGE_DELAY_MS: "350"
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web1:
+    build: ./web
+    environment:
+      DB_PATH: /data/quality.db
+      STATION_URL: http://station:8000
+      WORKER_NAME: web1
+    ports:
+      - "8011:8000"
+    volumes:
+      - quality-data:/data
+    depends_on:
+      station:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  web2:
+    build: ./web
+    environment:
+      DB_PATH: /data/quality.db
+      STATION_URL: http://station:8000
+      WORKER_NAME: web2
+    ports:
+      - "8012:8000"
+    volumes:
+      - quality-data:/data
+    depends_on:
+      station:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  quality-data:
